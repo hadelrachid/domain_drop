@@ -16,6 +16,7 @@ use DomainSystem\Plugins\domain_drop\DTO\DropshipProductDto;
 use DomainSystem\Plugins\domain_drop\DTO\ScrapedProductDto;
 use DomainSystem\Plugins\domain_drop\Services\CategoryTaxonomyService;
 use DomainSystem\Plugins\domain_drop\Services\CuratedCatalogProvider;
+use DomainSystem\Plugins\domain_drop\Services\Validation\MiningValidationHub;
 use RuntimeException;
 use Throwable;
 
@@ -42,6 +43,7 @@ class ProductMiningService implements ProductMiningServiceInterface
     private ?string $configFilePath;
     private ?\DomainSystem\Plugins\domain_drop\Contracts\DemandMetricsRepositoryInterface $demandMetricsRepo;
     private CuratedCatalogProviderInterface $catalogProvider;
+    private MiningValidationHub $validationHub;
 
     public function __construct(
         private readonly AliExpressApiClientInterface $apiClient,
@@ -52,13 +54,20 @@ class ProductMiningService implements ProductMiningServiceInterface
         ?string $configFilePath = null,
         ?\DomainSystem\Plugins\domain_drop\Contracts\DemandMetricsRepositoryInterface $demandMetricsRepo = null,
         ?CategoryTaxonomyInterface $taxonomy = null,
-        ?CuratedCatalogProviderInterface $catalogProvider = null
+        ?CuratedCatalogProviderInterface $catalogProvider = null,
+        ?MiningValidationHub $validationHub = null
     ) {
         $this->taxonomy = $taxonomy ?? new CategoryTaxonomyService();
         $this->linkScraper = $linkScraper ?? new AliExpressLinkScraperService($this->taxonomy);
         $this->configFilePath = $configFilePath;
         $this->demandMetricsRepo = $demandMetricsRepo;
         $this->catalogProvider = $catalogProvider ?? new CuratedCatalogProvider();
+        $this->validationHub = $validationHub ?? new MiningValidationHub();
+    }
+
+    public function getValidationHub(): MiningValidationHub
+    {
+        return $this->validationHub;
     }
 
     /**
@@ -73,44 +82,63 @@ class ProductMiningService implements ProductMiningServiceInterface
     {
         $category = self::normalizeCategory($category);
         $rawProducts = [];
+        $candidateTarget = min(60, max(25, $limit * 3));
         try {
-            $pageSize = min(max($limit, 10), 50);
-            $pagesNeeded = (int)ceil($limit / $pageSize);
+            $pageSize = min($candidateTarget, 50);
+            $pagesNeeded = (int)ceil($candidateTarget / $pageSize);
 
             // Obtém IDs e termos de busca oficiais da taxonomia alinhada ao AliExpress (categoria-e-atributos.pdf e dropshiper.pdf)
             $catIds = $this->taxonomy->getAliExpressCategoryIds($category);
             $primaryCatId = !empty($catIds) ? (string)$catIds[0] : null;
             $searchTerms = $this->taxonomy->getAliExpressSearchKeywords($category);
-            $primaryKeyword = !empty($searchTerms) ? $searchTerms[0] : $category;
+            if (empty($searchTerms)) {
+                $searchTerms = [$category];
+            }
 
-            for ($page = 1; $page <= $pagesNeeded; $page++) {
-                $batch = $this->apiClient->searchProducts([
-                    'keyword'           => $primaryKeyword,
-                    'keyWord'           => $primaryKeyword,
-                    'query'             => $primaryKeyword,
-                    'category_id'       => $primaryCatId,
-                    'categoryId'        => $primaryCatId,
-                    'feed_name'         => 'DS bestseller',
-                    'page_size'         => (string)$pageSize,
-                    'page_no'           => (string)$page,
-                    'page_index'        => (string)$page,
-                    'sort'              => $sort,
-                    'sort_by'           => 'orders,desc',
-                    'local'             => 'pt_BR',
-                    'country_code'      => 'BR',
-                    'country'           => 'BR',
-                    'currency'          => 'BRL',
-                    'ship_from_country' => 'BR',
-                    'ship_to_country'   => 'BR',
-                ]);
-                if (empty($batch) || !is_array($batch)) {
+            $seenIds = [];
+
+            // Estratégia Adaptativa (Tentativas e Acertos):
+            // Itera sobre os termos de busca oficiais da categoria até acumular a cota de candidatos limpos
+            foreach ($searchTerms as $term) {
+                if (count($rawProducts) >= $candidateTarget) {
                     break;
                 }
-                foreach ($batch as $bItem) {
-                    $rawProducts[] = $bItem;
-                }
-                if (count($rawProducts) >= $limit) {
-                    break;
+                try {
+                    $batch = $this->apiClient->searchProducts([
+                        'keyword'           => $term,
+                        'keyWord'           => $term,
+                        'query'             => $term,
+                        'category_id'       => $primaryCatId,
+                        'categoryId'        => $primaryCatId,
+                        'feed_name'         => 'DS bestseller',
+                        'page_size'         => '20',
+                        'page_no'           => '1',
+                        'page_index'        => '1',
+                        'sort'              => $sort,
+                        'sort_by'           => 'orders,desc',
+                        'local'             => 'pt_BR',
+                        'country_code'      => 'BR',
+                        'country'           => 'BR',
+                        'currency'          => 'BRL',
+                        'ship_from_country' => 'BR',
+                        'ship_to_country'   => 'BR',
+                    ]);
+
+                    if (is_array($batch) && !empty($batch)) {
+                        foreach ($batch as $bItem) {
+                            $pId = (string)($bItem['itemId'] ?? ($bItem['product_id'] ?? ($bItem['item_id'] ?? '')));
+                            if ($pId !== '' && !isset($seenIds[$pId])) {
+                                $seenIds[$pId] = true;
+                                $rawProducts[] = $bItem;
+                                if (count($rawProducts) >= $candidateTarget) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable $eTerm) {
+                    // Isolamento por termo: segue para a próxima tentativa da mesma categoria
+                    continue;
                 }
             }
         } catch (Throwable $e) {
@@ -131,10 +159,30 @@ class ProductMiningService implements ProductMiningServiceInterface
 
         // Se a API remota oficial não estiver conectada (ou em modo Test), utiliza catálogo curado e verificado
         if (empty($rawProducts)) {
-            $rawProducts = $this->getCuratedTrendingFallback($category, $limit, $sort);
+            $rawProducts = $this->getCuratedTrendingFallback($category, $candidateTarget, $sort);
         } else {
-            $rawProducts = self::scoreAndSortByReputation($rawProducts, $sort, 4.5, 50, $limit);
+            $rawProducts = self::scoreAndSortByReputation($rawProducts, $sort, 4.0, 10, $candidateTarget);
         }
+
+        // Ingestão no Container e Execução do Pipeline de Validação Contratual (Elimina 404s, Preços Isca e Restrições)
+        $validatedBatch = $this->validationHub->ingestAndValidateBatch($rawProducts);
+        $rawProducts = array_values($validatedBatch['valid_items']);
+
+        // Se os produtos externos descartados deixarem a cota abaixo do solicitado, complementa com o pool curado oficial
+        if (count($rawProducts) < $limit) {
+            $needed = $limit - count($rawProducts);
+            $curatedFallback = $this->getCuratedTrendingFallback($category, $needed + 5, $sort);
+            $validatedCurated = $this->validationHub->ingestAndValidateBatch($curatedFallback);
+            foreach ($validatedCurated['valid_items'] as $cItem) {
+                $rawProducts[] = $cItem;
+                if (count($rawProducts) >= $limit) {
+                    break;
+                }
+            }
+        }
+
+        // Garante a cota exata solicitada com produtos 100% aprovados pelos 4 Guardiões
+        $rawProducts = array_slice($rawProducts, 0, max(1, $limit));
 
         $mined = [];
         foreach ($rawProducts as $item) {
@@ -268,11 +316,18 @@ class ProductMiningService implements ProductMiningServiceInterface
         ];
 
         $termList = $searchTerms[$category] ?? ['smartwatch brasil', 'fone bluetooth'];
-        $searchTerm = $termList[array_rand($termList)];
-        // Empurra para a vitrine e estoques do Brasil (Remessa Conforme e Envio Local com Estoque no Brasil)
-        $searchUrl = "https://pt.aliexpress.com/w/wholesale-" . urlencode($searchTerm) . ".html?country=BR&locale=pt_BR&currency=BRL&shipFrom=BR&isrefine=y";
+        $html = null;
 
-        $html = $this->fetchLiveSearchHtml($searchUrl);
+        // Tentativas e acertos: testa os termos da categoria até obter retorno válido
+        foreach ($termList as $searchTerm) {
+            $searchUrl = "https://pt.aliexpress.com/w/wholesale-" . urlencode($searchTerm) . ".html?country=BR&locale=pt_BR&currency=BRL&shipFrom=BR&isrefine=y";
+            $fetched = $this->fetchLiveSearchHtml($searchUrl);
+            if ($fetched && is_string($fetched) && strlen($fetched) > 1000) {
+                $html = $fetched;
+                break;
+            }
+        }
+
         if (!$html || !is_string($html)) {
             return [];
         }
@@ -292,6 +347,14 @@ class ProductMiningService implements ProductMiningServiceInterface
             ?? ($initData['mods']['itemList']['content'] ?? []);
 
         if (empty($itemList) || !is_array($itemList)) {
+            return [];
+        }
+
+        // Ingestão no Container e Validação Contratual dos itens obtidos ao vivo
+        $validatedLiveBatch = $this->validationHub->ingestAndValidateBatch($itemList);
+        $itemList = array_values($validatedLiveBatch['valid_items']);
+
+        if (empty($itemList)) {
             return [];
         }
 
@@ -348,7 +411,7 @@ class ProductMiningService implements ProductMiningServiceInterface
                 $minPriceBrl = (float)($raw['prices']['salePrice']['minPrice'] ?? ($raw['prices']['originalPrice']['minPrice'] ?? 0.0));
                 $costPriceUsd = $minPriceBrl > 0.0 ? round($minPriceBrl / $usdRate, 2) : 12.00;
                 $config = $this->loadConfig();
-                $markup = isset($config['default_markup_percent']) ? (float)$config['default_markup_percent'] : 30.0;
+                $markup = isset($config['default_markup_percent']) ? (float)$config['default_markup_percent'] : 100.0;
                 $volatility = isset($config['default_volatility_percent']) ? (float)$config['default_volatility_percent'] : 0.0;
                 $salePriceBrl = $minPriceBrl > 0.0
                     ? $this->currencyConverter->calculateSalePriceFromBrl($minPriceBrl, $markup, $volatility)
@@ -670,7 +733,7 @@ class ProductMiningService implements ProductMiningServiceInterface
         $slug = $this->slugify($polishedTitle . '-' . substr($scraped->sourceId, -4));
         $costBrl = !empty($scraped->attributes['cost_price_brl']) ? (float)$scraped->attributes['cost_price_brl'] : 0.0;
         $config = $this->loadConfig();
-        $markup = isset($config['default_markup_percent']) ? (float)$config['default_markup_percent'] : 30.0;
+        $markup = isset($config['default_markup_percent']) ? (float)$config['default_markup_percent'] : 100.0;
         $volatility = isset($config['default_volatility_percent']) ? (float)$config['default_volatility_percent'] : 0.0;
         $salePriceBrl = $costBrl > 0.0
             ? $this->currencyConverter->calculateSalePriceFromBrl($costBrl, $markup, $volatility)
@@ -872,7 +935,7 @@ class ProductMiningService implements ProductMiningServiceInterface
         }
 
         $config = $this->loadConfig();
-        $markup = isset($config['default_markup_percent']) ? (float)$config['default_markup_percent'] : 30.0;
+        $markup = isset($config['default_markup_percent']) ? (float)$config['default_markup_percent'] : 100.0;
         $volatility = isset($config['default_volatility_percent']) ? (float)$config['default_volatility_percent'] : 0.0;
 
         if ($costBrl > 0.0) {
@@ -937,7 +1000,7 @@ class ProductMiningService implements ProductMiningServiceInterface
         if (!empty($item['itemUrl'])) {
             $props['aliexpress_url'] = (string)$item['itemUrl'];
         } elseif (!empty($aeId) && is_numeric($aeId)) {
-            $props['aliexpress_url'] = 'https://www.aliexpress.com/item/' . $aeId . '.html';
+            $props['aliexpress_url'] = 'https://pt.aliexpress.com/item/' . $aeId . '.html?country=BR&locale=pt_BR&currency=BRL';
         }
         if (!empty($item['productVideoUrl'])) {
             $props['video_url'] = (string)$item['productVideoUrl'];
