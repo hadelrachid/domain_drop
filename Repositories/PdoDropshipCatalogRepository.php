@@ -408,6 +408,61 @@ class PdoDropshipCatalogRepository implements DropshipCatalogRepositoryInterface
         return $stmt->execute([$salePriceBrl, $now, $id]);
     }
 
+    public function updateCategory(int $id, string $category): bool
+    {
+        $category = trim($category);
+        if ($category === '') {
+            return false;
+        }
+
+        $stmt = $this->pdo->prepare("
+            UPDATE domain_drop_catalog 
+            SET category = ?, updated_at = ? 
+            WHERE id = ?
+        ");
+
+        return $stmt->execute([$category, date('Y-m-d H:i:s'), $id]);
+    }
+
+    public function updateOrigin(int $id, string $origin): bool
+    {
+        $product = $this->findById($id);
+        if ($product === null) {
+            return false;
+        }
+
+        $origin = strtoupper(trim($origin));
+        $attributes = $product->attributes;
+
+        if ($origin === 'BR') {
+            $attributes['ship_from'] = 'BR';
+            $attributes['origem_brasil'] = true;
+            $attributes['entreposto_brasil'] = true;
+            $attributes['despacho_nacional'] = 'Estoque no Brasil (Entreposto Nacional)';
+            unset($attributes['origem_china'], $attributes['entreposto_china'], $attributes['origem_desconhecida']);
+        } elseif ($origin === 'CN') {
+            $attributes['ship_from'] = 'CN';
+            $attributes['origem_china'] = true;
+            $attributes['entreposto_china'] = true;
+            $attributes['despacho_origem'] = 'Entreposto Central AliExpress (China)';
+            $attributes['remessa_conforme'] = 'Importação Oficial com DDP e Rastreamento';
+            unset($attributes['origem_brasil'], $attributes['entreposto_brasil'], $attributes['despacho_nacional'], $attributes['origem_desconhecida']);
+        } else {
+            $attributes['ship_from'] = 'UNKNOWN';
+            $attributes['origem_desconhecida'] = true;
+            $attributes['despacho_origem'] = 'Origem Internacional Certificada';
+            unset($attributes['origem_brasil'], $attributes['entreposto_brasil'], $attributes['despacho_nacional'], $attributes['origem_china'], $attributes['entreposto_china']);
+        }
+
+        $stmt = $this->pdo->prepare("
+            UPDATE domain_drop_catalog 
+            SET attributes = ?, updated_at = ? 
+            WHERE id = ?
+        ");
+
+        return $stmt->execute([json_encode($attributes, JSON_UNESCAPED_UNICODE), date('Y-m-d H:i:s'), $id]);
+    }
+
     public function updateStatus(int $id, string $status): bool
     {
         $stmt = $this->pdo->prepare("
@@ -522,6 +577,77 @@ class PdoDropshipCatalogRepository implements DropshipCatalogRepositoryInterface
             $decoded = json_decode((string)$row['attributes'], true);
             if (is_array($decoded)) {
                 $attributes = $decoded;
+            }
+        }
+
+        // Auto-Cura e Retrocompatibilidade de Variantes para Produtos Históricos no Banco de Dados
+        $cat = (string)($row['category'] ?? 'Geral');
+        $title = (string)($row['title'] ?? '');
+        $isClothing = in_array($cat, [
+            'Moda, Roupas & Vestuário',
+            'Roupas, Bolsas & Calçados',
+            'Moda Íntima, Lingeries & Pijamas',
+            'Moda Íntima & Lingerie',
+            'Roupa Íntima & Pijamas',
+            'Moda Fitness, Leggings & Academia',
+        ], true) || preg_match('/\b(jaqueta|casaco|calça|calca|tênis|tenis|sapato|vestido|camisa|camiseta|shorts|bermuda|agasalho|conjunto|meia|roupa|blusa|moletom|lingerie|macacão|macacao|macaquinho|playsuit|playsuits|romper|rompers|body|bodies|top|cropped|biquíni|biquini|maiô|maio|tricô|trico|canelado|pijama|calçado|calcado|sandália|sandalia|chinelo|bota|sutiã|sutia|cueca|calcinha|bra|bras|bralette|bralettes|bojo|push up|push-up|corset|espartilho|underwear)\b/iu', $title);
+
+        $hasSize = false;
+        if (!empty($attributes['variation_axes']) && is_array($attributes['variation_axes'])) {
+            foreach (array_keys($attributes['variation_axes']) as $ax) {
+                if (preg_match('/(?:tamanho|size|medida|aro)/i', (string)$ax)) {
+                    $hasSize = true;
+                    break;
+                }
+            }
+        }
+
+        if (empty($attributes['variants']) || ($isClothing && !$hasSize)) {
+            $aeId = (string)($row['aliexpress_id'] ?? ($row['id'] ?? 'item'));
+            $priceBrl = (float)($row['sale_price_brl'] ?? 0.0);
+            $costUsd = (float)($row['cost_price_usd'] ?? 0.0);
+            $mainImg = (string)($row['main_image_url'] ?? '');
+            $isKids = isset($attributes['publico_alvo']) && str_contains(mb_strtolower((string)$attributes['publico_alvo'], 'UTF-8'), 'infantil');
+
+            $synthesized = \DomainSystem\Plugins\domain_drop\Services\ProductMiningService::synthesizeMissingVariants(
+                title: $title,
+                category: $cat,
+                aeId: $aeId,
+                salePriceBrl: $priceBrl,
+                costPriceUsd: $costUsd,
+                mainImage: $mainImg,
+                isKids: $isKids,
+                existingProps: $attributes
+            );
+            if (!empty($synthesized['variants'])) {
+                if ($isClothing && !$hasSize && !empty($attributes['variants'])) {
+                    // Se já tinha variantes de Cor, preserva e combina com os tamanhos sintetizados
+                    $sizes = $synthesized['variation_axes']['Tamanho'] ?? [];
+                    if (!empty($sizes)) {
+                        $attributes['variation_axes']['Tamanho'] = $sizes;
+                        $expanded = [];
+                        foreach ($attributes['variants'] as $v) {
+                            foreach ($sizes as $sIdx => $sz) {
+                                $szCode = strtoupper(preg_replace('/[^A-Za-z0-9]+/', '', (string)$sz) ?: (string)$sIdx);
+                                $vClone = $v;
+                                $vClone['sku_id'] = ($v['sku_id'] ?? $aeId) . '-' . $szCode;
+                                $vClone['options']['Tamanho'] = $sz;
+                                $expanded[] = $vClone;
+                            }
+                        }
+                        $attributes['variants'] = $expanded;
+                        $attributes['tamanhos_disponiveis'] = $sizes;
+                    }
+                } else {
+                    $attributes['variants'] = $synthesized['variants'];
+                    $attributes['variation_axes'] = $synthesized['variation_axes'];
+                    if (!empty($synthesized['cores_disponiveis'])) {
+                        $attributes['cores_disponiveis'] = $synthesized['cores_disponiveis'];
+                    }
+                    if (!empty($synthesized['tamanhos_disponiveis'])) {
+                        $attributes['tamanhos_disponiveis'] = $synthesized['tamanhos_disponiveis'];
+                    }
+                }
             }
         }
 

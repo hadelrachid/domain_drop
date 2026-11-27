@@ -31,14 +31,18 @@ class CatalogPackagingStation implements AssemblyStationInterface
         $origin = (string)$context->get('warehouse_origin', 'UNKNOWN');
         $categoryName = (string)$context->get('category_name', 'Geral');
 
-        $rating = (float)$context->get('rating', $context->get('evaluation_rate', 4.8));
+        $rating = (float)$context->get('rating', $context->get('evaluation_rate', 0.0));
         $ordersCount = (int)$context->get('orders_count', $context->get('sales_count', 0));
-        $stock = (int)$context->get('stock', 100);
+        $stock = (int)$context->get('stock', $context->get('inventory', 0));
+
+        $raw = $context->getRawData();
 
         // Montagem do payload canônico compatível com as views e repositórios
         $packaged = [
             'id' => $id,
             'productId' => $id,
+            'aliexpressId' => $id,
+            'aliexpress_id' => $id,
             'title' => $title,
             'image' => $mainImage,
             'image_url' => $mainImage,
@@ -60,6 +64,15 @@ class CatalogPackagingStation implements AssemblyStationInterface
             'stock' => $stock,
             'video_url' => (string)$context->get('video_url', ''),
             'skus' => $context->get('skus', []),
+            'ae_item_sku_info_dtos' => $context->get('ae_item_sku_info_dtos', $raw['ae_item_sku_info_dtos'] ?? []),
+            'variants' => $context->get('variants', $raw['variants'] ?? []),
+            'variation_axes' => $context->get('variation_axes', $raw['variation_axes'] ?? []),
+            'ae_item_property_dtos' => $context->get('ae_item_property_dtos', $raw['ae_item_property_dtos'] ?? []),
+            'properties' => $context->get('properties', $raw['properties'] ?? []),
+            'attributes' => $context->get('attributes', $raw['attributes'] ?? []),
+            'size_chart' => $context->get('size_chart', $raw['size_chart'] ?? null),
+            'sellingPoints' => $context->get('sellingPoints', $raw['sellingPoints'] ?? []),
+            'store_info' => $context->get('store_info', $raw['store_info'] ?? []),
             'history' => $context->getHistory(),
             'processed_at' => date('Y-m-d H:i:s')
         ];
